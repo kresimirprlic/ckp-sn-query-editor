@@ -224,26 +224,43 @@ When CMDB mode is on and an inner query also targets a `cmdb_ci*` table, the nes
 
 An interactive visual graph for exploring CMDB relationships. Access it via the **"View Diagram"** button in the CMDB Relationship Modal.
 
-The diagram displays:
-- The **focused CI** in the centre
-- **Parent CIs** above (amber border) with connecting bezier curves
-- **Child CIs** below (green border) with connecting bezier curves
-- Each node shows: CI Name, internal table name, display class name, and relationship type
+### Grouped Column Layout
+
+Related CIs are **grouped by class** (table) into vertical columns. Each column shows:
+
+- A **header** with the class name and a badge showing the total count of CIs of that class
+- Individual CI nodes listed vertically below
+- **Pagination** — the first 20 items per column are displayed initially; a "Load more" button at the bottom loads the next 20, showing how many remain
+
+This grouping ensures that all distinct classes are visible at a glance, even when one class has hundreds of relationships. Columns are ordered by count (largest first) and scroll horizontally when there are many class groups.
+
+### Diagram Sections
+
+The layout from top to bottom:
+
+1. **Grandchild of** (purple) — parents of parents (second-level hierarchy). Each grandchild-of column is connected via purple SVG lines to the specific parent column it came through, making lineage immediately clear. Each node shows an italic "via ParentName" label.
+2. **Child of** (amber) — direct parents of the focused CI, connected to the focus node via amber bezier curves
+3. **Focused CI** (centre, blue glow) — shows name, table name, and display class
+4. **Parent of** (green) — direct children of the focused CI, connected via green bezier curves
+
+The grandchild-of level is **optional** — controlled by a toggle in Settings ("Show additional parent level in diagram"). When disabled, only the single-level parent/child layout is shown and no extra API calls are made.
 
 ### Interactive Navigation
 
 - **Click** any connected node to navigate to it — its relationships are fetched on demand (lazy-loading)
 - A **breadcrumb trail** tracks your navigation path; click any crumb to jump back
 - A **Back button** returns to the previous CI
-- Up to 9 nodes per row; overflow is indicated with a "+N more" badge
-- The diagram adapts node widths and re-renders on window resize
 
-### Diagram Context Menu & Actions
+### Context Menus
 
-Right-click any node for:
+**Right-click any node** for:
 - **Expand relationships** — navigate to that CI
-- **Create query in new tab** — generates a `SELECT * FROM <table> WHERE sys_id = <id>` query in a new tab
+- **Create query in new tab** — generates a `SELECT sys_id, name, short_description FROM <table> WHERE sys_id = <id> LIMIT 1` query in a new tab
 - **Open in ServiceNow** — opens the record directly
+
+**Right-click a column header** for:
+- **Query all N records** — opens a new tab with a `SELECT ... WHERE sys_id IN (...)` query for every CI in that class group
+- **Open list in ServiceNow** — opens the class table list view directly
 
 ---
 
@@ -468,6 +485,7 @@ Open **Settings** and choose from multiple colour themes to customise the extens
 Access settings via the gear icon:
 
 - **Theme picker** — switch between visual themes
+- **CMDB Diagram** — toggle "Show additional parent level (grandchild-of) in diagram" on or off. When on (default), the diagram fetches and displays a second level of parent hierarchy. When off, only the direct parent/child level is shown. This setting persists across sessions
 - **Reset Table Cache** — clears cached table metadata and reloads the extension (useful if table structures have changed)
 - **Fetch All Fields** — manually fetches and caches all fields for a specified table
 
