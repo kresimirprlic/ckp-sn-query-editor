@@ -1,6 +1,6 @@
 # ServiceNow Query Editor — Chrome Extension
 
-A powerful Chrome extension that provides a SQL-like query interface for ServiceNow. Write queries against any ServiceNow table, explore CMDB relationships visually, manage saved queries in folders, edit records inline, and much more — all without leaving your browser.
+A powerful Chrome extension that provides a SQL-like query interface for ServiceNow. Write queries against any ServiceNow table, explore CMDB relationships visually, browse system logs in a dashboard-style Log Explorer, manage saved queries in folders, edit records inline, and much more — all without leaving your browser.
 
 ---
 
@@ -9,6 +9,7 @@ A powerful Chrome extension that provides a SQL-like query interface for Service
 - [Getting Started](#getting-started)
 - [Writing & Executing Queries](#writing--executing-queries)
 - [Inner (Nested) Queries](#inner-nested-queries)
+- [WHERE Subqueries (Semi-join / Anti-join)](#where-subqueries-semi-join--anti-join)
 - [CMDB Relationship Queries](#cmdb-relationship-queries)
 - [CMDB Relationship Diagram](#cmdb-relationship-diagram)
 - [Results Grid](#results-grid)
@@ -18,10 +19,11 @@ A powerful Chrome extension that provides a SQL-like query interface for Service
 - [Saved Queries](#saved-queries)
 - [Copy Query](#copy-query)
 - [Table Information Panel](#table-information-panel)
-- [Condition Builder](#condition-builder)
 - [Export Results](#export-results)
 - [Themes](#themes)
 - [Settings](#settings)
+- [Flow Inspector](#flow-inspector)
+- [Log Explorer](#log-explorer)
 - [Keyboard Shortcuts](#keyboard-shortcuts)
 
 ---
@@ -71,7 +73,9 @@ The extension maps standard SQL operators to their ServiceNow encoded-query equi
 | `NOT LIKE 'value%'` | Does not start with | `!STARTSWITH` | `name NOT LIKE 'Test%'` |
 | `NOT LIKE '%value'` | Does not end with | `!ENDSWITH` | `name NOT LIKE '%dev'` |
 | `IN (a, b, c)` | Value in list | `IN` | `state IN (1, 2, 3)` |
+| `IN (SELECT ...)` | Value in subquery | `IN` (resolved) | `group IN (SELECT group FROM ...)` |
 | `NOT IN (a, b, c)` | Value not in list | `NOT IN` | `state NOT IN (6, 7)` |
+| `NOT IN (SELECT ...)` | Value not in subquery | `NOT IN` (resolved) | `group NOT IN (SELECT group FROM ...)` |
 
 Conditions can be combined with `AND` / `OR` and grouped using parentheses.
 
@@ -84,6 +88,29 @@ SELECT COUNT FROM incident WHERE active = true
 ```
 
 This uses ServiceNow's aggregate API for performance.
+
+### SELECT DISTINCT
+
+Use `DISTINCT` to return only unique rows based on all selected fields:
+
+```sql
+SELECT DISTINCT assignment_group, priority
+FROM incident
+WHERE active = true
+```
+
+This fetches records from ServiceNow normally, then deduplicates client-side based on the combination of all fields in the `SELECT` clause. The result toast shows how many unique records were kept — for example, *"87 unique records (from 200 fetched) in 340ms"*.
+
+`DISTINCT` works with all other features including dot-walked fields, `WHERE` subqueries, and `ORDER BY`:
+
+```sql
+SELECT DISTINCT caller_id.department
+FROM incident
+WHERE active = true AND priority < 3
+ORDER BY caller_id.department
+```
+
+> **Note:** ServiceNow's `LIMIT` is applied server-side before deduplication, so the final unique count may be lower than the `LIMIT`. For example, `LIMIT 100` fetches 100 records, which might yield 60 unique rows after deduplication.
 
 ### Query Formatting
 
@@ -155,8 +182,32 @@ LIMIT 50
 
 1. The outer query executes first, fetching the parent records
 2. For each inner query, the extension automatically resolves the relationship between the child table and the parent table (via reference fields in `sys_dictionary`)
-3. Child records are batch-fetched using `IN` queries on the reference field, ensuring efficient API usage
-4. The progress modal tracks each phase: "Fetching parent records..." then "Fetching inner query 'tasks'..."
+3. One bounded query is fired per parent (`refField = <parent_id> LIMIT N+1`) at concurrency 10 — each call is small and reliable
+4. The progress modal tracks each phase: "Fetching parent records..." then "Fetching inner query 'tasks'... (X/Y parents)"
+
+### Per-Parent Row Cap
+
+When no inner `LIMIT` is specified, the extension caps each parent's children at **200 rows** by default (matching Salesforce SOQL subquery behaviour). This prevents a single high-volume parent from dominating the response and keeps the result set manageable.
+
+When a parent has more than 200 matching children:
+
+- The cell is highlighted in **amber** with a **`200+ rows`** label instead of `200 rows`
+- A warning toast appears after execution naming the truncated parents
+
+To fetch more for a specific parent, either:
+- Add an explicit inner `LIMIT` — e.g. `(SELECT sys_id FROM incident LIMIT 1000)` — overrides the default cap, no warning
+- Use the **Counts** toggle (below) to see the real totals server-side
+
+### Counts Toggle
+
+After executing a query with inner SELECTs, a **`Counts`** button appears in the results action row. Click it to switch inner columns from records to **server-side aggregate counts**.
+
+- Each inner cell becomes a plain number — the exact total per parent (e.g. `3,900`), regardless of the 200-row cap
+- Counts are sortable: click the column header to find the parents with the most (or fewest) related records
+- Counts are filterable: type `>= 100` in the column filter to show only parents with at least 100 children
+- Re-click **Counts** to return to records mode
+
+Useful when you want to know *how many* related records each parent has rather than seeing the records themselves — for example, "which user groups have the most assigned incidents?"
 
 ### Nested Results Modal
 
@@ -165,6 +216,85 @@ Inner query results appear as a clickable badge in the results grid showing the 
 From the nested results modal, you can:
 - Sort and filter columns
 - Right-click to open a record in ServiceNow or view full record details
+
+---
+
+## WHERE Subqueries (Semi-join / Anti-join)
+
+Use a `SELECT` subquery inside `IN` or `NOT IN` in the `WHERE` clause to filter parent records based on the existence (or absence) of matching child records.
+
+### Semi-join — "has at least one child matching…"
+
+Return only parent records whose ID appears in the child query results:
+
+```sql
+SELECT user.name, group.name
+FROM sys_user_grmember
+WHERE user.active = true
+AND group IN (
+    SELECT group
+    FROM sys_group_has_role
+    WHERE role.name = 'itil'
+)
+```
+
+This returns group members where the group has the "itil" role assigned.
+
+### Anti-join — "has no children matching…"
+
+Return only parent records whose ID does *not* appear in the child query results:
+
+```sql
+SELECT number, short_description
+FROM incident
+WHERE active = true
+AND assigned_to NOT IN (
+    SELECT user
+    FROM sys_user_grmember
+    WHERE group.name = 'Network'
+)
+```
+
+This returns active incidents where the assignee is not a member of the "Network" group.
+
+### How It Works
+
+Since ServiceNow's Table API does not support subqueries in encoded queries, the extension uses a **two-phase execution**:
+
+1. **Phase 1 — Subquery:** The inner `SELECT` is executed first. The values of the specified field (e.g. `group` sys_ids) are collected from the results.
+2. **Phase 2 — Main query:** The collected values are substituted into the outer query as a flat comma-separated list (e.g. `groupINid1,id2,id3,...`), and the main query executes normally.
+
+A progress modal tracks the subquery resolution phase before the main query begins.
+
+### Subquery Syntax
+
+The inner `SELECT` supports the same clauses as regular queries:
+
+```sql
+field IN (SELECT return_field FROM child_table WHERE conditions)
+field NOT IN (SELECT return_field FROM child_table WHERE conditions)
+```
+
+- The first field in the inner `SELECT` is the one whose values are collected
+- `WHERE`, `ORDER BY`, and `LIMIT` are all supported in the inner query
+- Multiple subqueries can be used in the same `WHERE` clause
+
+### Combining with DISTINCT
+
+WHERE subqueries and `DISTINCT` work together:
+
+```sql
+SELECT DISTINCT caller_id.name
+FROM incident
+WHERE active = true
+AND assignment_group IN (
+    SELECT group
+    FROM sys_group_has_role
+    WHERE role.name = 'itil'
+)
+```
+
+The subquery resolves first, then the main query fetches records, and finally DISTINCT deduplicates the results.
 
 ---
 
@@ -213,6 +343,25 @@ LIMIT 100
 - Fields in `CMDB_FIELDS(...)` are added between the defaults and `rel_type`
 - If omitted, defaults to: Name, Class, Relationship Type
 - Autocomplete suggests base `cmdb_ci` fields when the cursor is inside `CMDB_FIELDS(...)`
+
+#### Authoritative Counts + Per-CI Fetch + Drill-Down
+
+The `P:N C:M` badge counts come from ServiceNow's `/api/now/stats/cmdb_rel_ci` aggregate API, so they always reflect the **true** number of direct parent/child relationships even when the row fetch is capped.
+
+**Per-CI fetch with adaptive cap.** Row data is fetched one query per CI per direction (concurrency 10), with the per-CI row cap adapting to outer-query size:
+- 1–2 CIs in the result → cap 1000 per CI
+- 3–10 CIs → cap 500
+- 11+ CIs → cap 200 (fairness — every CI gets useful data even on wide pages)
+
+Cells with truncated row data show a small amber dot on the badge; the tooltip and modal banner show `Showing X of Y (truncated)`. The modal always renders a section as long as the count for that direction is > 0, even if zero rows came back (so you never see a "missing" Parent of / Child of section for a heavily-connected CI).
+
+**Drill-down: Fetch all.** Inside the modal (and on the diagram's focused node), each truncated section shows a `Fetch all N →` button. Clicking it fires an unbounded per-CI fetch (safety cap 25,000), mutates the relationship list in place, clears the truncation flag, and re-renders. A confirm prompt appears when `count > 5000`.
+
+CMDB relationships are direct only — `cmdb_rel_ci` stores one-hop edges, so the counts you see reflect direct parents/children, not transitive closure.
+
+#### Diagram Column Filter (iter-15)
+
+Each class column in the CMDB diagram has a filter input at the top: type any substring and the visible items narrow live (case-insensitive match on name). The column shows every loaded item in a scrollable list — no "Load more" pagination. Filter state persists across "Fetch all" re-renders so you don't lose your search when expanding the dataset; it resets when you navigate to a different focused CI.
 
 ### CMDB + Inner Queries
 
@@ -447,21 +596,6 @@ A quick count of inheritance levels, outgoing references, and incoming reference
 
 ---
 
-## Condition Builder
-
-Click the **Condition Builder** button to open a visual query builder sidebar. Construct queries without writing SQL:
-
-1. Enter a **table name**
-2. Specify **fields** to return (or `*`)
-3. Add **conditions** — each row has a field, operator, and value
-4. Combine conditions with **AND** / **OR**
-5. Set **ORDER BY** and **LIMIT**
-6. Click **Generate Query** to insert the constructed query into the editor
-
-The available operators include `=`, `!=`, `>`, `<`, `>=`, `<=`, `LIKE`, `IN`, and `NOT IN`.
-
----
-
 ## Export Results
 
 ### Export to CSV
@@ -488,6 +622,145 @@ Access settings via the gear icon:
 - **CMDB Diagram** — toggle "Show additional parent level (grandchild-of) in diagram" on or off. When on (default), the diagram fetches and displays a second level of parent hierarchy. When off, only the direct parent/child level is shown. This setting persists across sessions
 - **Reset Table Cache** — clears cached table metadata and reloads the extension (useful if table structures have changed)
 - **Fetch All Fields** — manually fetches and caches all fields for a specified table
+
+---
+
+## Flow Inspector
+
+A dedicated tool for discovering and exploring flows, scripts, and UI configurations across a ServiceNow instance. Access it from the **app switcher** dropdown in the header.
+
+### Search Modes
+
+Find records using three lookup modes, selectable from the dropdown:
+
+| Mode | Description |
+|------|-------------|
+| **Trigger table** | Finds flows triggered by a specific table (e.g. `incident`), plus Business Rules, Client Scripts, UI Actions, and UI Policies that operate on that table |
+| **Scope** | Finds all records belonging to a specific application scope |
+| **Name** | Searches by name across all enabled record types (minimum 2 characters) |
+
+An **Auto-detect mode** toggle infers whether input looks like a table API name or a record name and switches the lookup mode automatically.
+
+### Supported Record Types
+
+The inspector searches across 10 record types spanning three groups:
+
+| Group | Types |
+|-------|-------|
+| **Flow** | Flows, Subflows, Actions |
+| **Script** | Business Rules, Script Includes, Scheduled Jobs, Script Actions |
+| **UI** | Client Scripts, UI Actions, UI Policies |
+
+### Pre-Search Type Toggle
+
+A row of toggle pills below the lookup bar controls which record types are included in the search. This determines which API calls are made — selecting fewer types means faster, more focused results.
+
+- **All** — searches every type; only the "All" pill is highlighted
+- **Individual pills** — click to narrow the search to specific types; pills are colour-coded by group (green for flows, teal for scripts, indigo for UI)
+- At least one type must remain selected
+- The selection persists across sessions via browser storage
+
+### Post-Search Filters
+
+After results load, client-side filters refine the displayed items without additional API calls:
+
+- **Type** — filter by record type (only types present in results are shown, with counts)
+- **Status** — All / Active / Inactive
+- **Scope** — filter by application scope
+- **Trigger** / **Table** — filter by trigger type or table (when applicable)
+- **Sort** — Name A–Z, Name Z–A, Recently Modified, Oldest Modified, Type
+- **Search** — free-text filter across names, descriptions, scopes, and type-specific fields (applied on Enter)
+
+### Result Cards
+
+Each record is displayed as a card showing:
+
+- Record name, type badge (colour-coded), and active/inactive status
+- Type-specific secondary info (e.g. "When: before · Table: incident" for Business Rules, "Event: incident.assigned" for Script Actions)
+- Scope, creation/update dates, and author
+- Direct link to open the record in ServiceNow
+
+### Detail Views
+
+Clicking a card opens a detail view. Flows, subflows, and actions get a **rich detail view** with trigger information, action steps, "Used in this flow" / "Used by" cross-references, and an "Export for AI" feature. New record types (Business Rules, Script Includes, etc.) get a **lightweight detail view** showing type-specific fields, metadata, and an "Open in ServiceNow" link.
+
+### Navigation
+
+Detail views support breadcrumb navigation — clicking a referenced subflow or action opens its detail view, and the breadcrumb trail lets you navigate back through the chain.
+
+---
+
+## Log Explorer
+
+A dashboard-style mini application for browsing ServiceNow system logs. Access it from the **app switcher** dropdown in the header.
+
+### Log Sources
+
+Switch between six ServiceNow log tables using the source dropdown:
+
+| Source | Table | What It Shows |
+|--------|-------|---------------|
+| **System Log** | `syslog` | Platform logs — Trace, Debug, Info, Warning, Error, Fatal messages |
+| **Transaction Log** | `syslog_transaction` | REST/SOAP calls, scheduler runs, response times |
+| **Events** | `sysevent` | System events (flow triggers, scheduled jobs, etc.) |
+| **Audit Log** | `sys_audit` | Record changes — who changed what field, old vs. new value |
+| **Email Log** | `sys_email` | Inbound and outbound email records |
+| **Outbound HTTP** | `sys_outbound_http_log` | Outbound REST/SOAP calls and scripted HTTP requests to external systems |
+
+Each source has pre-configured default columns appropriate to its data.
+
+### Time Range
+
+Select a time window from the dropdown: **Last 15 min**, **30 min**, **1 hour** (default), **6 hours**, or **24 hours**. Narrower ranges are faster because ServiceNow log tables use rotating shards — querying "Last 1 hour" typically hits only 1–2 shards instead of all 8.
+
+### Level Filter Cards
+
+When viewing System Log, colour-coded cards at the top show the count of records per severity level — **Trace**, **Debug**, **Info**, **Warning**, **Error**, and **Fatal** — matching ServiceNow's actual `syslog.level` dictionary values. Click any card to filter the log stream to that level. Multiple levels can be toggled independently.
+
+The **"All" button** controls the fetch mode:
+
+- **All ON** (default) — Refresh fetches all log types. Clicking individual level cards applies instant client-side filtering on the loaded data.
+- **All OFF** — Refresh fetches only the selected log types from the server (e.g. only Info logs). This is useful on high-volume instances where mixed log types fill the fetch limit within seconds, making it hard to see specific log types over a meaningful time range.
+
+### Search & Filter
+
+- **Search** — type in the search bar to filter across all field values (client-side, instant)
+- **Source dropdown** — filter by the log source component (e.g. `com.glide.ui.ServletErrorListener`)
+- **User dropdown** — filter by the user who triggered the log entry
+
+All filters are applied together (AND logic) and operate entirely client-side on the loaded records — no additional API calls.
+
+### Log Stream
+
+Records are displayed in a grid with a sticky column header. Columns are automatically sized based on content width — short fields like time and level stay compact, while longer fields like message expand to fill available space.
+
+- **Click any row** to expand it, revealing all field values in a detail panel
+- **Copy button** in the expanded panel copies all field labels and values to the clipboard, each on a new line
+- **Column resize** — drag the right edge of any column header to adjust its width
+- **Load More** — appears when the server has more records beyond the current batch. Click to fetch the next page using the same query and filters. Shows "Loading..." feedback during the fetch
+
+### Live Mode
+
+Toggle the **Live** switch in the toolbar to enable automatic refreshing. When active, the Log Explorer fetches new records every 10 seconds and prepends them to the stream. A pulsing green indicator shows that live mode is active. Live mode stops automatically when switching to another app or changing the log source.
+
+### Configure Fields & Fetch Limit
+
+Click the **Fields** button to open the configuration modal:
+
+- **Fields** — enter comma-separated field names to customise which columns are displayed. Each log source remembers its own field configuration independently
+- **Records to fetch** — set how many records to load per batch (default 350, range 50–5000)
+- **Reset to Default** — restores the source's default fields and the 350 record limit
+
+### Performance
+
+The Log Explorer uses optimised API calls compared to the standard Query Editor:
+
+- Skips display value resolution (`sysparm_display_value=false`) — level names like "Error" are mapped client-side
+- Skips the separate count query (`sysparm_no_count=true`)
+- Requests only the fields needed (`sysparm_fields` is always explicit)
+- Excludes reference link metadata (`sysparm_exclude_reference_link=true`)
+
+A toast notification after each fetch shows the number of records and time taken (e.g. "Fetched 350 records in 2140ms").
 
 ---
 
