@@ -8,6 +8,7 @@ A powerful Chrome extension that provides a SQL-like query interface for Service
 
 - [Getting Started](#getting-started)
 - [Writing & Executing Queries](#writing--executing-queries)
+- [Query Cookbook — by Complexity](#query-cookbook--by-complexity)
 - [Inner (Nested) Queries](#inner-nested-queries)
 - [WHERE Subqueries (Semi-join / Anti-join)](#where-subqueries-semi-join--anti-join)
 - [CMDB Relationship Queries](#cmdb-relationship-queries)
@@ -139,6 +140,242 @@ Navigate suggestions with **Up/Down** arrows, select with **Tab** or **Enter**, 
 - Click **Execute** or press **Ctrl+Enter** (Cmd+Enter on Mac) to run the query
 - A progress modal shows the number of records fetched so far vs. the total count, with a percentage indicator
 - Click **Cancel** at any time to stop fetching and display the records retrieved so far
+
+---
+
+## Query Cookbook — by Complexity
+
+A progressive tour of the editor's query capabilities, from the smallest useful query up to a fully composed real-world one. Each level introduces one new capability; everything below it stays valid as you climb.
+
+### Level 1 — Basic SELECT
+
+Return rows from a table, choosing your own columns and order:
+
+```sql
+SELECT number, short_description, state
+FROM incident
+LIMIT 25
+```
+
+- `SELECT *` returns every field on the table.
+- Column order in the results grid follows the order in `SELECT`.
+- Without `LIMIT`, the editor still fetches in bounded batches (see [Execute & Cancel](#execute--cancel)).
+
+#### Sorting
+
+Single-field `ORDER BY` with optional direction:
+
+```sql
+SELECT number, priority, sys_created_on
+FROM incident
+ORDER BY sys_created_on DESC
+LIMIT 100
+```
+
+### Level 2 — Dot-walked fields (reference traversal)
+
+Reference fields (`caller_id`, `assigned_to`, `cmdb_ci`, `assignment_group`, …) point at records on another table. Use **dot notation** to read fields on the referenced record. Works in `SELECT`, `WHERE`, and `ORDER BY`:
+
+```sql
+SELECT number, caller_id.name, caller_id.email, assignment_group.name
+FROM incident
+WHERE active = true
+ORDER BY caller_id.name ASC
+LIMIT 50
+```
+
+Chains are supported — every step except the last must itself be a reference field:
+
+```sql
+SELECT number,
+       caller_id.manager.email,
+       caller_id.department.name
+FROM incident
+LIMIT 25
+```
+
+The autocomplete suggests fields one segment at a time as you type each `.`.
+
+### Level 3 — Filtering: AND / OR / parentheses
+
+Combine conditions with `AND` and `OR`, and group with parentheses to control precedence:
+
+```sql
+SELECT number, priority, state
+FROM incident
+WHERE active = true
+  AND priority IN (1, 2)
+  AND (state = 1 OR state = 2)
+ORDER BY priority ASC
+```
+
+The same works against dot-walked fields:
+
+```sql
+SELECT number, caller_id.name, assignment_group.name
+FROM incident
+WHERE active = true
+  AND (assignment_group.name = 'Network'
+       OR assignment_group.name = 'Database')
+  AND caller_id.email LIKE '%@acme.com'
+LIMIT 200
+```
+
+See [Supported Operators](#supported-operators) for the full operator map.
+
+#### Pattern matching with LIKE / NOT LIKE
+
+The wildcard position determines which ServiceNow operator is emitted:
+
+```sql
+WHERE short_description LIKE '%network%'   -- contains
+WHERE name              LIKE 'SAP%'        -- starts with
+WHERE email             LIKE '%@acme.com'  -- ends with
+WHERE name              LIKE 'web-prod-01' -- exact match (no wildcards)
+```
+
+`NOT LIKE` follows the same rules (`NOT LIKE`, `!STARTSWITH`, `!ENDSWITH`, or `!=` depending on wildcard placement).
+
+#### IN with a literal list
+
+```sql
+SELECT number, state
+FROM incident
+WHERE active = true
+  AND state IN (1, 2, 3)
+  AND priority NOT IN (4, 5)
+```
+
+### Level 4 — IN subqueries (semi-join / anti-join)
+
+Filter parent rows by the results of a second query, without writing a JOIN.
+
+**Semi-join** — group members whose `group` has the `itil` role assigned:
+
+```sql
+SELECT user.name, group.name
+FROM sys_user_grmember
+WHERE user.active = false
+  AND group IN (
+    SELECT group
+    FROM sys_group_has_role
+    WHERE role.name = 'itil'
+  )
+```
+
+**Anti-join** — active incidents whose assignee is *not* a member of the Network group:
+
+```sql
+SELECT number, short_description, assigned_to.name
+FROM incident
+WHERE active = true
+  AND assigned_to NOT IN (
+    SELECT user
+    FROM sys_user_grmember
+    WHERE group.name = 'Network'
+  )
+```
+
+See [WHERE Subqueries](#where-subqueries-semi-join--anti-join) for the two-phase execution model.
+
+### Level 5 — Inner (nested) SELECTs
+
+Fetch related child records inline with each parent — each parent row gets a cell containing its related records, with their own count and modal.
+
+```sql
+SELECT number, short_description,
+  (SELECT number, state, short_description
+   FROM incident_task
+   WHERE active = true
+   ORDER BY number DESC)
+FROM incident
+WHERE priority = 1
+LIMIT 50
+```
+
+Multiple inner queries, each with its own alias (`AS` goes immediately after the inner table name):
+
+```sql
+SELECT number,
+  (SELECT number, state FROM incident_task AS tasks
+   WHERE active = true),
+  (SELECT file_name, size_bytes FROM sys_attachment AS attachments)
+FROM incident
+WHERE active = true
+LIMIT 50
+```
+
+See [Inner (Nested) Queries](#inner-nested-queries) for the per-parent row cap, the `Counts` toggle (server-side aggregate counts per parent), and the truncation banner.
+
+### Level 6 — DISTINCT and COUNT
+
+**DISTINCT** — return only unique combinations of the selected fields (deduplicated client-side; see [SELECT DISTINCT](#select-distinct)):
+
+```sql
+SELECT DISTINCT assignment_group.name, caller_id.department
+FROM incident
+WHERE active = true
+LIMIT 1000
+```
+
+**COUNT** — fast row count without fetching rows, via ServiceNow's aggregate API (see [SELECT COUNT](#select-count)):
+
+```sql
+SELECT COUNT
+FROM incident
+WHERE active = true
+  AND priority IN (1, 2)
+```
+
+DISTINCT and WHERE subqueries also compose:
+
+```sql
+SELECT DISTINCT caller_id.name
+FROM incident
+WHERE active = true
+  AND assignment_group IN (
+    SELECT group FROM sys_group_has_role WHERE role.name = 'itil'
+  )
+```
+
+### Level 7 — CMDB relationship queries
+
+When the **CMDB** toggle is on and the table is a `cmdb_ci*` descendant, an extra Relations column appears. Use `WITH CMDB_FIELDS(...)` to control which fields show up for related CIs in the relationship modal:
+
+```sql
+SELECT sys_id, name, sys_class_name
+FROM cmdb_ci_server
+WHERE operational_status = 1
+WITH CMDB_FIELDS(install_status, model_id.name, location.name)
+LIMIT 100
+```
+
+See [CMDB Relationship Queries](#cmdb-relationship-queries) for badge semantics and the diagram view.
+
+### Putting it all together
+
+A realistic "find me the active high-priority outages handled by the on-call group, with their recent tasks" query stacks most of the above:
+
+```sql
+SELECT DISTINCT caller_id.name, caller_id.department, assignment_group.name,
+  (SELECT number, state, sys_updated_on
+   FROM incident_task AS recent_tasks
+   ORDER BY sys_updated_on DESC)
+FROM incident
+WHERE active = true
+  AND priority IN (1, 2)
+  AND (short_description LIKE '%outage%'
+       OR short_description LIKE '%down%')
+  AND assigned_to IN (
+    SELECT user
+    FROM sys_user_grmember
+    WHERE group.name = 'Network Operations'
+  )
+ORDER BY sys_created_on DESC
+LIMIT 200
+```
+
+This single query exercises: DISTINCT, three-segment dot-walking, grouped AND/OR, two `LIKE` variants, an `IN` literal list, an `IN` subquery (semi-join), an inner `SELECT` with its own `ORDER BY` and alias, plus an outer `ORDER BY` and `LIMIT`.
 
 ---
 
@@ -711,7 +948,11 @@ Each source has pre-configured default columns appropriate to its data.
 
 ### Time Range
 
-Select a time window from the dropdown: **Last 15 min**, **30 min**, **1 hour** (default), **6 hours**, or **24 hours**. Narrower ranges are faster because ServiceNow log tables use rotating shards — querying "Last 1 hour" typically hits only 1–2 shards instead of all 8.
+Select a time window from the dropdown: **Last 15 min**, **30 min**, **1 hour** (default), **6 hours**, **24 hours**, or **Custom range…**. Narrower ranges are faster because ServiceNow log tables use rotating shards — querying "Last 1 hour" typically hits only 1–2 shards instead of all 8.
+
+#### Custom Range
+
+Choosing **Custom range…** reveals two `datetime-local` pickers (**From** / **To**) and an **Apply** button. Pick any window down to the second; the explorer converts the values into `javascript:gs.dateGenerate(...)` bounds on both sides of the source's time field. Bounds that are empty or inverted (From > To) are ignored so the rest of the query still runs cleanly. The custom From/To values are preserved across reloads.
 
 ### Level Filter Cards
 
@@ -734,10 +975,12 @@ All filters are applied together (AND logic) and operate entirely client-side on
 
 Records are displayed in a grid with a sticky column header. Columns are automatically sized based on content width — short fields like time and level stay compact, while longer fields like message expand to fill available space.
 
-- **Click any row** to expand it, revealing all field values in a detail panel
-- **Copy button** in the expanded panel copies all field labels and values to the clipboard, each on a new line
-- **Column resize** — drag the right edge of any column header to adjust its width
-- **Load More** — appears when the server has more records beyond the current batch. Click to fetch the next page using the same query and filters. Shows "Loading..." feedback during the fetch
+- **Click any row** to expand it, revealing all field values in a detail panel. Only one row is expanded at a time; opening a new one collapses the previous
+- **Level badge** — System Log rows render the level as a colour-coded badge (Trace/Debug/Info in blue, Warning in amber, Error in red, Fatal in deep red). Levels are mapped client-side from `syslog.level`'s numeric values
+- **Cell truncation** — long values (e.g. messages) are truncated to ~200 characters in the grid for performance; the full value is shown on hover via the cell's tooltip and in the expanded detail panel
+- **Copy button** in the expanded panel copies all field labels and values to the clipboard, each on a new line. The button flashes a "Copied" confirmation
+- **Column resize** — drag the right edge of any column header to adjust its width. Per-column widths persist for the lifetime of the explorer instance
+- **Load More** — appears when the server returned a full batch, indicating more records may exist. Click to fetch the next page (using the same source, time range, level, and filters) and append it to the stream. Shows "Loading..." feedback during the fetch
 
 ### Live Mode
 
@@ -747,9 +990,20 @@ Toggle the **Live** switch in the toolbar to enable automatic refreshing. When a
 
 Click the **Fields** button to open the configuration modal:
 
-- **Fields** — enter comma-separated field names to customise which columns are displayed. Each log source remembers its own field configuration independently
+- **Fields** — enter comma-separated field names to customise which columns are displayed. Each log source remembers its own field configuration independently. `sys_id` is always included even if you omit it from the list (it's needed for row identity)
 - **Records to fetch** — set how many records to load per batch (default 350, range 50–5000)
 - **Reset to Default** — restores the source's default fields and the 350 record limit
+
+### Persisted Preferences
+
+The following settings survive across browser sessions via `chrome.storage.local`:
+
+- The selected **log source**
+- The current **time range** (including the Custom range From/To values)
+- Per-source **field overrides** entered in the Fields modal
+- The **records-to-fetch** limit
+
+Stats counts, search text, level toggles, and column widths are intentionally **not** persisted — each new session starts fresh on filters but with your chosen workspace shape.
 
 ### Performance
 
